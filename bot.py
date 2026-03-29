@@ -7,8 +7,8 @@ from telegram.constants import ParseMode
 import random
 
 # ================= CONFIGURE THESE =================
-TELEGRAM_BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"
-TELEGRAM_CHAT_ID = "PASTE_YOUR_CHAT_ID_HERE"
+TELEGRAM_BOT_TOKEN = "8749443547:AAEXvMnpfO_sc1_GQxb2-xljA5Zz1NT5EZ4"
+TELEGRAM_CHAT_ID = "7195135480"
 # ===================================================
 
 # Anti-scam protection
