@@ -2,18 +2,20 @@ import asyncio
 import aiohttp
 import logging
 import os
-import sys
+import random
+import time
 from datetime import datetime, timedelta
 from telegram import Bot
 from telegram.constants import ParseMode
 
-# Get credentials from Railway environment variables
+# Get credentials
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8749443547:AAEXvMnpfO_sc1_GQxb2-xljA5Zz1NT5EZ4")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "7195135480")
 
-CHECK_INTERVAL = 60  # Can check more often with Binance
-VOLUME_SPIKE_THRESHOLD = 2.5  # 2.5x average volume
-MIN_VOLUME_BTC = 10  # Minimum 10 BTC volume
+# Settings - slower to avoid rate limits
+CHECK_INTERVAL = 300  # 5 minutes between checks
+VOLUME_SPIKE_THRESHOLD = 3.0
+MIN_VOLUME_USD = 50000
 
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -21,162 +23,227 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Rotate user agents to look less like a bot
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 14_7_1 like Mac OS X) AppleWebKit/605.1.15'
+]
+
 class VolumeAlertBot:
     def __init__(self):
         self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
         self.session = None
-        self.volume_history = {}  # Store volume history per symbol
+        self.volume_history = {}
         self.alerted_tokens = set()
         
     async def start(self):
+        # Random delay on startup so all Railway users don't hit at same time
+        await asyncio.sleep(random.randint(10, 60))
+        
         self.session = aiohttp.ClientSession()
         
-        # Test Telegram connection
         try:
             await self.bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
-                text="🚀 Bot is LIVE!\nMonitoring Binance BNB pairs every minute..."
+                text="🚀 Bot LIVE!\nMonitoring BSC USD pairs (checking every 5 min)..."
             )
-            logger.info("✅ Telegram connected")
         except Exception as e:
-            logger.error(f"❌ Telegram failed: {e}")
+            logger.error(f"Telegram error: {e}")
             return
-        
-        logger.info("Starting monitoring...")
         
         while True:
             try:
-                await self.check_binance_volume()
-                await asyncio.sleep(CHECK_INTERVAL)
+                await self.check_bsc_pairs()
+                # Add random jitter to check interval
+                sleep_time = CHECK_INTERVAL + random.randint(0, 120)
+                logger.info(f"Sleeping {sleep_time} seconds...")
+                await asyncio.sleep(sleep_time)
             except Exception as e:
-                logger.error(f"Loop error: {e}")
-                await asyncio.sleep(30)
+                logger.error(f"Main error: {e}")
+                await asyncio.sleep(60)
     
-    async def fetch_binance_ticker(self):
-        """Fetch 24hr ticker data from Binance"""
-        url = "https://api.binance.com/api/v3/ticker/24hr"
+    async def fetch_with_retry(self, url, max_retries=5):
+        """Fetch with multiple retries and different user agents"""
+        for attempt in range(max_retries):
+            headers = {
+                'User-Agent': random.choice(USER_AGENTS),
+                'Accept': 'application/json',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Referer': 'https://dexscreener.com/',
+            }
+            
+            try:
+                # Exponential backoff: wait longer between retries
+                if attempt > 0:
+                    wait_time = (2 ** attempt) + random.randint(1, 5)
+                    logger.info(f"Retry {attempt}, waiting {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                
+                async with self.session.get(url, headers=headers, timeout=30) as resp:
+                    if resp.status == 200:
+                        content_type = resp.headers.get('content-type', '')
+                        if 'json' in content_type:
+                            return await resp.json()
+                        else:
+                            text = await resp.text()
+                            if text.startswith('{'):
+                                # Might be JSON anyway
+                                import json
+                                return json.loads(text)
+                            logger.warning(f"Got HTML instead of JSON")
+                            continue
+                    elif resp.status == 429:  # Rate limited
+                        logger.warning("Rate limited, backing off...")
+                        await asyncio.sleep(60)
+                    else:
+                        logger.warning(f"HTTP {resp.status}")
+                        
+            except Exception as e:
+                logger.error(f"Attempt {attempt+1} error: {e}")
+                continue
         
-        try:
-            async with self.session.get(url, timeout=30) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                else:
-                    logger.warning(f"Binance HTTP {resp.status}")
-                    return None
-        except Exception as e:
-            logger.error(f"Binance fetch error: {e}")
-            return None
+        return None
     
-    async def check_binance_volume(self):
-        """Check BNB pairs on Binance for volume spikes"""
-        data = await self.fetch_binance_ticker()
+    async def check_bsc_pairs(self):
+        """Check BSC pairs with USD stables"""
+        # Try multiple endpoints
+        urls = [
+            "https://api.dexscreener.com/latest/dexes/pancakeswapv2",
+            "https://api.dexscreener.com/latest/dexes/biswap",
+            "https://api.dexscreener.com/latest/dexes/apeswap"
+        ]
         
-        if not data:
-            logger.error("No data from Binance")
+        all_pairs = []
+        
+        for url in urls:
+            data = await self.fetch_with_retry(url)
+            if data and 'pairs' in data:
+                all_pairs.extend(data['pairs'])
+                # Wait between API calls
+                await asyncio.sleep(2)
+        
+        if not all_pairs:
+            logger.error("No data from any DEX")
             return
         
-        # Filter for BNB pairs only (e.g., BTCBNB, ETHBNB, etc.)
-        bnb_pairs = [t for t in data if t['symbol'].endswith('BNB')]
+        logger.info(f"Got {len(all_pairs)} total pairs")
         
-        logger.info(f"Checking {len(bnb_pairs)} BNB pairs...")
+        # Filter for BSC chain with USD pairs
+        usd_pairs = []
+        for pair in all_pairs:
+            if pair.get('chainId') != 'bsc':
+                continue
+            
+            quote_token = pair.get('quoteToken', {}).get('symbol', '')
+            if quote_token in ['USDT', 'USDC', 'BUSD', 'DAI']:
+                try:
+                    vol = float(pair.get('volumeUsd24h', 0))
+                    if vol >= MIN_VOLUME_USD:
+                        usd_pairs.append(pair)
+                except:
+                    continue
         
-        for ticker in bnb_pairs:
+        logger.info(f"Analyzing {len(usd_pairs)} USD pairs...")
+        
+        for pair in usd_pairs:
             try:
-                await self.analyze_ticker(ticker)
+                await self.analyze_pair(pair)
             except Exception as e:
                 continue
     
-    async def analyze_ticker(self, ticker):
-        """Analyze individual ticker"""
-        symbol = ticker['symbol']
-        base_asset = symbol.replace('BNB', '')
-        
-        # Skip if not a real trading pair (BNB/BNB or too short)
-        if len(base_asset) < 2:
-            return
+    async def analyze_pair(self, pair):
+        """Analyze pair for volume spikes"""
+        pair_address = pair['pairAddress']
+        token_symbol = pair['baseToken']['symbol']
+        token_name = pair['baseToken'].get('name', '')[:30]  # Truncate long names
         
         try:
-            volume = float(ticker['volume'])
-            quote_volume = float(ticker['quoteVolume'])  # Volume in BNB
-            price = float(ticker['lastPrice'])
-            price_change = float(ticker['priceChangePercent'])
-            
-            # Skip low volume pairs (less than 10 BNB volume)
-            if quote_volume < MIN_VOLUME_BTC:
-                return
-                
-        except (ValueError, TypeError):
+            volume_24h = float(pair.get('volumeUsd24h', 0))
+            liquidity = float(pair.get('liquidityUsd', 0))
+            price = float(pair.get('priceUsd', 0))
+            price_change = float(pair.get('priceChange24h', 0))
+        except:
             return
         
-        # Track volume history
-        if symbol not in self.volume_history:
-            self.volume_history[symbol] = []
+        # Track history
+        if pair_address not in self.volume_history:
+            self.volume_history[pair_address] = []
         
-        history = self.volume_history[symbol]
-        history.append(quote_volume)
+        history = self.volume_history[pair_address]
+        history.append(volume_24h)
         
-        # Keep last 10 readings
         if len(history) > 10:
             history.pop(0)
         
-        # Need at least 3 data points
         if len(history) < 3:
             return
         
-        # Calculate average volume (excluding current)
         avg_volume = sum(history[:-1]) / len(history[:-1])
         
         if avg_volume > 0:
-            ratio = quote_volume / avg_volume
+            ratio = volume_24h / avg_volume
             
-            # Check for volume spike
             if ratio >= VOLUME_SPIKE_THRESHOLD:
-                alert_key = f"{symbol}_{datetime.now().hour}"
+                alert_key = f"{pair_address}_{datetime.now().hour}"
                 if alert_key not in self.alerted_tokens:
                     await self.send_alert(
-                        base_asset, symbol, quote_volume, ratio, 
-                        price, price_change
+                        token_symbol, token_name, volume_24h, ratio,
+                        price, liquidity, price_change, pair_address
                     )
                     self.alerted_tokens.add(alert_key)
                     
-                    # Cleanup old alerts
                     if len(self.alerted_tokens) > 100:
                         self.alerted_tokens.pop()
     
-    async def send_alert(self, asset, symbol, volume, ratio, price, price_change):
-        """Send Telegram alert"""
+    async def send_alert(self, symbol, name, volume, ratio, price, liquidity, price_change, address):
+        """Send alert to Telegram"""
         
-        # Determine if bullish or bearish
-        if price_change > 5:
-            trend = "📈 STRONG UP"
+        # Quality rating
+        liq_ratio = liquidity / volume if volume > 0 else 0
+        if liq_ratio < 0.1:
+            quality, emoji = "⚠️ RISKY", "🚨"
+        elif liq_ratio < 0.3:
+            quality, emoji = "⚡ MODERATE", "⚡"
+        else:
+            quality, emoji = "✅ GOOD", "🎯"
+        
+        # Price trend
+        if price_change > 10:
+            trend = "🚀 PUMPING"
         elif price_change > 0:
             trend = "📈 Up"
-        elif price_change < -5:
-            trend = "📉 STRONG DOWN"
+        elif price_change < -10:
+            trend = "📉 DUMPING"
         else:
             trend = "📉 Down"
         
         message = f"""
-🚨 *BNB CHAIN VOLUME ALERT*
+{emoji} *BSC VOLUME SPIKE*
 
-🔹 *{asset}/BNB*
-💰 Price: {price:.8f} BNB
-📊 24h Change: {price_change:+.2f}% {trend}
-💧 Volume: {volume:.2f} BNB ({ratio:.1f}x average)
+🔹 *{symbol}*
+{name and f'({name})' or ''}
+💰 Price: ${price:.6f} ({price_change:+.1f}%) {trend}
+📊 Volume: ${volume:,.0f} ({ratio:.1f}x avg)
+💧 Liquidity: ${liquidity:,.0f}
+📈 Quality: {quality}
 
-🔗 [Trade on Binance](https://www.binance.com/en/trade/{symbol})
+🔗 [Chart](https://dexscreener.com/bsc/{address})
+🥞 [Buy](https://pancakeswap.finance/swap?outputCurrency={address})
+📋 [Contract](https://bscscan.com/address/{address})
 
 ⏰ {datetime.now().strftime('%H:%M:%S')}
-⚠️ *DYOR - Not financial advice*
+⚠️ *DYOR*
 """
         try:
             await self.bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
                 text=message,
                 parse_mode=ParseMode.MARKDOWN,
-                disable_web_page_preview=True
+                disable_web_page_preview=False
             )
-            logger.info(f"Alert sent: {asset}")
+            logger.info(f"✅ Alert: {symbol}")
         except Exception as e:
             logger.error(f"Send failed: {e}")
 
